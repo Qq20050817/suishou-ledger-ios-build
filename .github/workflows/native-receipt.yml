@@ -1,0 +1,112 @@
+name: Build and verify the iOS app
+on:
+  push:
+    branches: ["main"]
+    paths: ["NativeReceipt/**", "main.m", "icons/**", ".github/workflows/native-receipt.yml"]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: native-receipt-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  compile:
+    runs-on: macos-26
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Apple toolchain
+        run: |
+          xcodebuild -version
+          SDK_VERSION=$(xcrun --sdk iphoneos --show-sdk-version)
+          test "${SDK_VERSION%%.*}" -ge 26
+          swift --version
+      - name: Test receipt state and API contract
+        working-directory: NativeReceipt
+        run: swift test
+      - name: Generate native project
+        run: python3 NativeReceipt/scripts/generate_project.py
+      - name: Build iPhone App and App Intents metadata
+        run: |
+          set -o pipefail
+          xcodebuild -project NativeReceipt/SuishouLedger.xcodeproj -scheme SuishouLedger -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build/native CODE_SIGNING_ALLOWED=NO build | tee native-build.log
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p dist/Payload
+          ditto build/native/Build/Products/Release-iphoneos/SuishouLedger.app dist/Payload/SuishouLedger.app
+          test -d dist/Payload/SuishouLedger.app/Metadata.appintents
+          file dist/Payload/SuishouLedger.app/SuishouLedger
+          plutil -lint dist/Payload/SuishouLedger.app/Info.plist
+          test "$(plutil -extract CFBundleShortVersionString raw dist/Payload/SuishouLedger.app/Info.plist)" = 3.0.8
+          test "$(plutil -extract CFBundleVersion raw dist/Payload/SuishouLedger.app/Info.plist)" = 20
+          (cd dist && ditto -c -k --keepParent Payload SuishouLedger-3.0.8-independent-unsigned.ipa)
+          (cd dist && shasum -a 256 SuishouLedger-3.0.8-independent-unsigned.ipa > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SuishouLedger-native-receipt-unsigned
+          path: |
+            dist/SuishouLedger-3.0.8-independent-unsigned.ipa
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+      - name: Render native card on iPhone simulator
+        run: |
+          set -o pipefail
+          DEVICE_ID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for runtime,items in d["devices"].items() if "iOS-26" in runtime for x in items if x["name"].startswith("iPhone")))')
+          xcrun simctl bootstatus "$DEVICE_ID" -b
+          xcodebuild -project NativeReceipt/SuishouLedger.xcodeproj -scheme SuishouLedger -configuration Debug -sdk iphonesimulator -destination "platform=iOS Simulator,id=$DEVICE_ID" -derivedDataPath build/simulator -parallel-testing-enabled NO -test-timeouts-enabled YES -default-test-execution-time-allowance 90 -maximum-test-execution-time-allowance 120 -resultBundlePath build/native-render.xcresult CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=YES ARCHS="$(uname -m)" test | tee native-render.log
+      - name: Export simulator evidence even on a failed test
+        if: always()
+        run: |
+          if test -d build/native-render.xcresult; then
+            xcrun xcresulttool export attachments --path build/native-render.xcresult --output-path dist/native-preview
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-receipt-preview
+          path: dist/native-preview
+          if-no-files-found: warn
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-receipt-build-log
+          path: |
+            native-build.log
+            native-render.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  publish:
+    needs: compile
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: SuishouLedger-native-receipt-unsigned
+          path: dist
+      - name: Publish the verified IPA
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          sha256sum -c SHA256SUMS
+          tag=v3.0.8
+          asset=SuishouLedger-3.0.8-independent-unsigned.ipa
+          if gh release view "$tag" >/dev/null 2>&1; then
+            mkdir already-released
+            gh release download "$tag" --pattern SHA256SUMS --dir already-released
+            cmp SHA256SUMS already-released/SHA256SUMS
+          else
+            gh release create "$tag" "$asset" SHA256SUMS --target "$GITHUB_SHA" \
+              --title "随手账 3.0.8" \
+              --notes "iPhone / iPad，iOS 或 iPadOS 26 及以上。未签名 IPA，安装时须使用自己的证书。改进购物、钱包和银行卡截图的字段识别。云端草稿就绪后，当前小票可自动补全。关闭预览后可用「继续上张截图记账」重新打开待核对小票。"
+          fi
