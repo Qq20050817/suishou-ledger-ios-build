@@ -2,7 +2,7 @@ name: Build and verify the iOS app
 on:
   push:
     branches: ["main"]
-    paths: ["NativeReceipt/**", "main.m", "icons/**", ".github/workflows/native-receipt.yml"]
+    paths: ["NativeReceipt/**", "main.m", "Info.plist", "icons/**", ".github/workflows/native-receipt.yml"]
   workflow_dispatch:
 permissions:
   contents: read
