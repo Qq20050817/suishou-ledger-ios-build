@@ -1,0 +1,47 @@
+name: Verify receipt simulator suite serially
+on:
+  push:
+    branches: ["verify/simulator-3.0.8"]
+    paths: [".github/workflows/receipt-motion-probe.yml"]
+permissions:
+  contents: read
+jobs:
+  motion:
+    runs-on: macos-15
+    timeout-minutes: 16
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare simulator project
+        run: |
+          python3 NativeReceipt/scripts/generate_project.py
+          DEVICE_ID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for runtime,items in d["devices"].items() if "iOS-26" in runtime for x in items if x["name"].startswith("iPhone")))')
+          echo "RECEIPT_SIMULATOR=$DEVICE_ID" >> "$GITHUB_ENV"
+      - name: Compile the simulator test separately
+        timeout-minutes: 4
+        run: |
+          set -o pipefail
+          xcodebuild -project NativeReceipt/SuishouLedger.xcodeproj -scheme SuishouLedger -configuration Debug -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' -derivedDataPath build/motion-simulator CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=YES ARCHS="$(uname -m)" build-for-testing | tee /tmp/receipt-motion-build.log
+      - name: Boot the simulator
+        timeout-minutes: 3
+        run: xcrun simctl bootstatus "$RECEIPT_SIMULATOR" -b
+      - name: Run the full receipt simulator suite on one booted device
+        timeout-minutes: 6
+        run: |
+          set -o pipefail
+          xcodebuild -project NativeReceipt/SuishouLedger.xcodeproj -scheme SuishouLedger -configuration Debug -sdk iphonesimulator -destination "platform=iOS Simulator,id=$RECEIPT_SIMULATOR" -derivedDataPath build/motion-simulator -parallel-testing-enabled NO -test-timeouts-enabled YES -default-test-execution-time-allowance 60 -maximum-test-execution-time-allowance 90 -resultBundlePath build/motion.xcresult CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=YES ARCHS="$(uname -m)" test-without-building | tee /tmp/receipt-motion-screen.log
+      - name: Extract screen evidence
+        if: always()
+        run: |
+          mkdir -p dist/motion
+          if test -d build/motion.xcresult; then xcrun xcresulttool export attachments --path build/motion.xcresult --output-path dist/motion; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: on-screen-motion-evidence
+          path: |
+            dist/motion
+            /tmp/receipt-motion-build.log
+            /tmp/receipt-motion-screen.log
+          retention-days: 2
